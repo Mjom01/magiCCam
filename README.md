@@ -10,10 +10,21 @@ Pehelysúlyú (≈220 KB, nulla függőség a Windows API-n kívül) Rust app, a
 ## Hogyan működik
 
 DirectShow-t használ, mert ez az egyetlen Windows API, ami *minden* fenti forrást lát
-(az OBS virtuális kamera és a DeckLink is csak itt jelenik meg). A kép a forrásból
-közvetlenül az **Enhanced Video Renderer**-be (GPU-s skálázás, letterbox) megy, a program
-egyetlen képkockát sem másol — ezért gyenge gépen is alig terhel. Nagyon régi rendszeren
-automatikusan a régi DirectShow rendererre vált vissza.
+(az OBS virtuális kamera és a DeckLink is csak itt jelenik meg). A kép GPU-s rendererbe
+(EVR, ill. VMR-9) megy, ami skáláz és letterboxol — gyenge gépen is alig terhel.
+
+Megnyitáskor egy rövid tervet jár végig, és az első működő kombinációt használja:
+
+1. forrás → GPU renderer **közvetlenül** (nulla konverzió — a hardveres kamerák/kártyák így mennek)
+2. ugyanez VMR-9-cel (régebbi gépek)
+3. DirectShow által beszúrt dekóderrel/konverterrel (MJPEG kamerák, illetve a virtuális kamerák,
+   pl. OBS, NVIDIA Broadcast, amik nem hajlandók közvetlenül GPU-pufferbe írni)
+4. bármilyen renderer (végső tartalék)
+
+Minden lépésnél kipróbálja ugyanannak a módnak (felbontás + fps) a többi pixelformátumát is
+(NV12 / I420 / YUY2 / MJPEG...), és ellenőrzi, hogy a stream tényleg fut-e (pl. az OBS NV12-je
+csatlakozik, de azonnal leáll — ilyenkor továbblép). A működő kombinációt eszközönként megjegyzi,
+így az újracsatlakozás azonnali.
 
 Formátumválasztás: folyamatos (≥24 fps) mód előnyben, max. 1080p (állítható), a nyers
 formátum előnyben az MJPEG/H.264-gyel szemben (kevesebb CPU). DeckLink-szerű kártyáknál
@@ -42,6 +53,16 @@ magiccam -k                  # ne állítson formátumot
 | M | következő monitor |
 | R | eszközök újraolvasása |
 | jobb klikk | menü (eszközlista, stb.) |
+
+## Hibakeresés
+
+`MAGICCAM_DEBUG=1` környezeti változóval a `%TEMP%\magiccam_debug.txt`-be naplózza, melyik
+renderer / formátum kombinációt próbálta, mi lett a graph, és 3 mp után a kirajzolt kép átlagos
+fényerejét (0 = fekete kép).
+
+```
+$env:MAGICCAM_DEBUG=1; .\magiccam.exe -w
+```
 
 ## Build
 

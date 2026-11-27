@@ -21,6 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 const WM_GRAPH: u32 = WM_APP + 1;
 const TIMER_CURSOR: usize = 1;
 const TIMER_RECONNECT: usize = 2;
+const TIMER_SNAPSHOT: usize = 3;
 const ID_DEVICE: usize = 1000;
 const ID_FULLSCREEN: usize = 1;
 const ID_REFRESH: usize = 2;
@@ -238,10 +239,12 @@ fn main() {
             })
         });
 
+        // Show first: the very first ShowWindow of a process may apply the
+        // launcher's show state, which would undo an earlier fullscreen switch.
+        let _ = ShowWindow(hwnd, SW_SHOW);
         if !args.windowed {
             with_app(|app| app.set_fullscreen(true));
         }
-        let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         SetTimer(Some(hwnd), TIMER_CURSOR, 500, None);
         with_app(|app| app.connect());
@@ -341,6 +344,9 @@ impl App {
                 }
                 unsafe {
                     let _ = KillTimer(Some(self.hwnd), TIMER_RECONNECT);
+                    if std::env::var_os("MAGICCAM_DEBUG").is_some() {
+                        SetTimer(Some(self.hwnd), TIMER_SNAPSHOT, 3000, None);
+                    }
                 }
                 self.update_title();
                 self.invalidate();
@@ -478,7 +484,7 @@ impl App {
             let _ = AppendMenuW(menu, MF_STRING, ID_MONITOR, w!("Next &monitor\tM"));
             let _ = AppendMenuW(menu, MF_STRING, ID_REFRESH, w!("&Rescan devices\tR"));
             if let Some(g) = &self.graph {
-                let info = format!("{} / {}", g.format, if g.is_evr() { "EVR" } else { "legacy renderer" });
+                let info = format!("{} / {}", g.format, g.renderer_name());
                 let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(wide(&info).as_ptr()));
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -494,7 +500,7 @@ impl App {
 
     fn paint(&self, hdc: HDC) {
         if let Some(g) = &self.graph {
-            g.repaint();
+            g.repaint(self.hwnd, hdc);
             return;
         }
         unsafe {
@@ -534,7 +540,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_ERASEBKGND => {
             // EVR paints the whole client area (incl. black bars) itself.
-            if with_app(|app| app.graph.as_ref().is_some_and(|g| g.is_evr())).unwrap_or(false) {
+            if with_app(|app| app.graph.as_ref().is_some_and(|g| g.paints_window())).unwrap_or(false) {
                 LRESULT(1)
             } else {
                 DefWindowProcW(hwnd, msg, wp, lp)
@@ -542,7 +548,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_GRAPH => {
             with_app(|app| {
-                if app.graph.as_ref().is_some_and(capture::device_failed) {
+                if app.graph.as_ref().is_some_and(|g| g.failed()) {
                     app.graph = None;
                     app.current = None;
                     app.status = "No signal (source stopped or unplugged) - waiting for it...".into();
@@ -558,6 +564,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         if app.fullscreen && !app.cursor_hidden && app.last_mouse.elapsed() > Duration::from_secs(2) {
                             app.cursor_hidden = true;
                             SetCursor(None);
+                        }
+                    });
+                }
+                TIMER_SNAPSHOT => {
+                    with_app(|app| {
+                        if let Some(g) = &app.graph {
+                            g.debug_snapshot();
                         }
                     });
                 }
@@ -656,6 +669,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DISPLAYCHANGE => {
             with_app(|app| {
+                if let Some(g) = &app.graph {
+                    g.display_changed();
+                }
                 if app.fullscreen {
                     app.set_fullscreen(true);
                 }

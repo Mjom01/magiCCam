@@ -3,25 +3,51 @@
 //! DirectShow is used on purpose: it is the one API on Windows that sees *every*
 //! kind of video source — UVC webcams, the OBS Virtual Camera, capture cards,
 //! Blackmagic DeckLink / UltraStudio / Intensity, ATEM Mini (UVC) — and it can
-//! render straight into our window via the Enhanced Video Renderer, so no frame
-//! ever touches our own code (zero copies, GPU scaling, works on ancient boxes).
+//! render straight into our window with a GPU renderer (EVR / VMR-9), so in the
+//! common case no frame ever touches our own code.
+//!
+//! Some sources are picky (e.g. software virtual cameras insist on their own
+//! buffers and refuse to feed a GPU renderer directly), so opening walks a small
+//! plan of renderer x connection x format combinations, verifies that the stream
+//! actually keeps running, and remembers what worked per device.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 
 use windows::core::{w, Interface, GUID, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, RECT};
+use windows::Win32::Foundation::{COLORREF, E_FAIL, HWND, RECT};
+use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::Media::DirectShow::*;
 use windows::Win32::Media::MediaFoundation::{
     IMFGetService, IMFVideoDisplayControl, AM_MEDIA_TYPE, CLSID_CaptureGraphBuilder2,
-    CLSID_EnhancedVideoRenderer, CLSID_FilterGraph, CLSID_SystemDeviceEnum,
-    CLSID_VideoInputDeviceCategory, FORMAT_VideoInfo, FORMAT_VideoInfo2, MEDIATYPE_Interleaved,
-    MEDIATYPE_Video, MFVideoARMode_PreservePicture, MR_VIDEO_RENDER_SERVICE, PIN_CATEGORY_CAPTURE,
-    PIN_CATEGORY_PREVIEW, VIDEOINFOHEADER, VIDEOINFOHEADER2,
+    CLSID_EnhancedVideoRenderer, CLSID_FilterGraph, CLSID_SystemDeviceEnum, CLSID_VideoInputDeviceCategory,
+    CLSID_VideoMixingRenderer9, FORMAT_VideoInfo, FORMAT_VideoInfo2, MEDIATYPE_Interleaved, MEDIATYPE_Video,
+    MFVideoARMode_PreservePicture, MR_VIDEO_RENDER_SERVICE, PIN_CATEGORY_CAPTURE, PIN_CATEGORY_PREVIEW,
+    VIDEOINFOHEADER, VIDEOINFOHEADER2,
 };
 use windows::Win32::System::Com::StructuredStorage::IPropertyBag;
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, IMoniker, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::Variant::{VariantClear, VARIANT, VT_BSTR};
 use windows::Win32::UI::WindowsAndMessaging::{WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS};
+
+/// Set MAGICCAM_DEBUG=1 to get %TEMP%\magiccam_debug.txt
+pub fn debug_log(msg: &str) {
+    use std::io::Write;
+    if std::env::var_os("MAGICCAM_DEBUG").is_none() {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::temp_dir().join("magiccam_debug.txt"))
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Devices
 
 pub struct Device {
     pub name: String,
@@ -31,7 +57,7 @@ pub struct Device {
 }
 
 impl Device {
-    /// Stable key used to remember the last device between runs.
+    /// Stable key used to remember the device between runs.
     pub fn key(&self) -> String {
         self.path.clone().unwrap_or_else(|| self.name.clone())
     }
@@ -87,81 +113,226 @@ pub struct Options {
     pub max_height: i32,
 }
 
+// ---------------------------------------------------------------------------
+// Graph
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kind {
+    /// Enhanced Video Renderer (Vista+), GPU scaling.
+    Evr,
+    /// Video Mixing Renderer 9 (XP+), GPU scaling.
+    Vmr9,
+    /// Whatever DirectShow picks, in its own child window. Last resort.
+    Default,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Link {
+    /// Source pin straight into the renderer: zero extra work.
+    Direct,
+    /// Let DirectShow insert decoders/converters (MJPEG, picky virtual cams...).
+    Smart,
+}
+
+/// Tried in order; for each step every format alternative is tried.
+const PLAN: [(Kind, Link); 5] = [
+    (Kind::Evr, Link::Direct),
+    (Kind::Vmr9, Link::Direct),
+    (Kind::Evr, Link::Smart),
+    (Kind::Vmr9, Link::Smart),
+    (Kind::Default, Link::Smart),
+];
+
+/// How many format alternatives (same size & fps, other pixel format) to try.
+const MAX_ALTS: usize = 4;
+
+thread_local! {
+    /// device key -> (plan step, format alternative) that worked last time.
+    static WORKING: RefCell<HashMap<String, (usize, usize)>> = RefCell::new(HashMap::new());
+}
+
 enum Renderer {
     Evr(IMFVideoDisplayControl),
+    Vmr9(IVMRWindowlessControl9),
     Legacy(IVideoWindow, Option<IBasicVideo>),
 }
 
 pub struct Graph {
     control: IMediaControl,
     renderer: Renderer,
-    _graph: IGraphBuilder,
+    graph: IGraphBuilder,
     pub format: String,
+}
+
+enum BuildError {
+    /// This format alternative does not exist — stop trying further ones.
+    NoSuchFormat,
+    Failed(windows::core::Error),
+}
+
+impl From<windows::core::Error> for BuildError {
+    fn from(e: windows::core::Error) -> Self {
+        BuildError::Failed(e)
+    }
 }
 
 impl Graph {
     pub fn open(dev: &Device, hwnd: HWND, notify_msg: u32, opts: Options) -> windows::core::Result<Graph> {
-        // Prefer EVR (GPU scaling, letterboxing built in); fall back to whatever
-        // renderer DirectShow picks (VMR/old Video Renderer) on very old systems.
-        unsafe {
-            match Self::build(dev, hwnd, notify_msg, opts, true) {
-                Ok(g) => Ok(g),
-                Err(_) => Self::build(dev, hwnd, notify_msg, opts, false),
+        let key = dev.key();
+        let mut attempts: Vec<(usize, usize)> = Vec::new();
+        if let Some(w) = WORKING.with(|m| m.borrow().get(&key).copied()) {
+            attempts.push(w);
+        }
+        for step in 0..PLAN.len() {
+            for alt in 0..MAX_ALTS {
+                if !attempts.contains(&(step, alt)) {
+                    attempts.push((step, alt));
+                }
             }
         }
+
+        // Creating the source filter can be slow (some drivers take ~1 s), so one
+        // instance is moved from graph to graph between attempts.
+        let src: IBaseFilter = unsafe { dev.moniker.BindToObject(None, None)? };
+        let mut last = windows::core::Error::from(E_FAIL);
+        let mut n_alts = usize::MAX; // learned when an alternative turns out not to exist
+        for (step, alt) in attempts {
+            if alt >= n_alts {
+                continue;
+            }
+            let (kind, link) = PLAN[step];
+            match unsafe { Self::build(dev, &src, hwnd, notify_msg, opts, kind, link, alt) } {
+                Ok(g) => {
+                    WORKING.with(|m| m.borrow_mut().insert(key, (step, alt)));
+                    return Ok(g);
+                }
+                Err(BuildError::NoSuchFormat) => n_alts = n_alts.min(alt),
+                Err(BuildError::Failed(e)) => {
+                    debug_log(&format!("{kind:?}/{link:?} alt {alt} failed: {e:?}"));
+                    last = e;
+                }
+            }
+        }
+        WORKING.with(|m| m.borrow_mut().remove(&dev.key()));
+        Err(last)
     }
 
-    unsafe fn build(dev: &Device, hwnd: HWND, notify_msg: u32, opts: Options, use_evr: bool) -> windows::core::Result<Graph> {
+    /// Builds and starts one attempt; on failure the source is taken out of the
+    /// graph again so the next attempt can reuse it.
+    unsafe fn build(
+        dev: &Device,
+        src: &IBaseFilter,
+        hwnd: HWND,
+        notify_msg: u32,
+        opts: Options,
+        kind: Kind,
+        link: Link,
+        alt: usize,
+    ) -> Result<Graph, BuildError> {
         let graph: IGraphBuilder = CoCreateInstance(&CLSID_FilterGraph, None, CLSCTX_INPROC_SERVER)?;
-        let cgb: ICaptureGraphBuilder2 = CoCreateInstance(&CLSID_CaptureGraphBuilder2, None, CLSCTX_INPROC_SERVER)?;
-        cgb.SetFiltergraph(&graph)?;
+        graph.AddFilter(src, w!("Source"))?;
+        let r = Self::build_in(&graph, dev, src, hwnd, notify_msg, opts, kind, link, alt);
+        if r.is_err() {
+            if let Ok(c) = graph.cast::<IMediaControl>() {
+                let _ = c.Stop();
+            }
+            let _ = graph.RemoveFilter(src);
+        }
+        r
+    }
 
-        let src: IBaseFilter = dev.moniker.BindToObject(None, None)?;
-        graph.AddFilter(&src, w!("Source"))?;
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn build_in(
+        graph: &IGraphBuilder,
+        dev: &Device,
+        src: &IBaseFilter,
+        hwnd: HWND,
+        notify_msg: u32,
+        opts: Options,
+        kind: Kind,
+        link: Link,
+        alt: usize,
+    ) -> Result<Graph, BuildError> {
+        let cgb: ICaptureGraphBuilder2 = CoCreateInstance(&CLSID_CaptureGraphBuilder2, None, CLSCTX_INPROC_SERVER)?;
+        cgb.SetFiltergraph(graph)?;
 
         let lname = dev.name.to_lowercase();
         let pro_card = ["decklink", "intensity", "ultrastudio"].iter().any(|k| lname.contains(k));
         let mut format = String::from("device default");
         if !(opts.keep_format || pro_card) {
-            if let Some(f) = choose_format(&cgb, &src, opts.max_height) {
-                format = f;
+            match set_format(&cgb, src, opts.max_height, alt) {
+                Some(f) => format = f,
+                None if alt > 0 => return Err(BuildError::NoSuchFormat),
+                None => {}
+            }
+        } else if alt > 0 {
+            return Err(BuildError::NoSuchFormat);
+        }
+
+        let (renderer, rfilter): (Option<Renderer>, Option<IBaseFilter>) = match kind {
+            Kind::Evr => {
+                let f: IBaseFilter = CoCreateInstance(&CLSID_EnhancedVideoRenderer, None, CLSCTX_INPROC_SERVER)?;
+                graph.AddFilter(&f, w!("EVR"))?;
+                let ctl: IMFVideoDisplayControl = f.cast::<IMFGetService>()?.GetService(&MR_VIDEO_RENDER_SERVICE)?;
+                ctl.SetVideoWindow(hwnd)?;
+                ctl.SetAspectRatioMode(MFVideoARMode_PreservePicture.0 as u32)?;
+                let _ = ctl.SetBorderColor(COLORREF(0));
+                (Some(Renderer::Evr(ctl)), Some(f))
+            }
+            Kind::Vmr9 => {
+                let f: IBaseFilter = CoCreateInstance(&CLSID_VideoMixingRenderer9, None, CLSCTX_INPROC_SERVER)?;
+                graph.AddFilter(&f, w!("VMR9"))?;
+                f.cast::<IVMRFilterConfig9>()?.SetRenderingMode(VMR9Mode_Windowless.0 as u32)?;
+                let ctl: IVMRWindowlessControl9 = f.cast()?;
+                ctl.SetVideoClippingWindow(hwnd)?;
+                ctl.SetAspectRatioMode(VMR9ARMode_LetterBox.0 as u32)?;
+                let _ = ctl.SetBorderColor(COLORREF(0));
+                (Some(Renderer::Vmr9(ctl)), Some(f))
+            }
+            Kind::Default => (None, None),
+        };
+
+        let mut ok = false;
+        'pins: for cat in [Some(&PIN_CATEGORY_CAPTURE), Some(&PIN_CATEGORY_PREVIEW), None] {
+            for mt in [&MEDIATYPE_Video, &MEDIATYPE_Interleaved] {
+                let Ok(pin) = cgb.FindPin(src, PINDIR_OUTPUT, cat.map(|c| c as *const GUID), Some(mt as *const GUID), true, 0)
+                else {
+                    continue;
+                };
+                let r = match (&rfilter, link) {
+                    (Some(f), Link::Direct) => match pin_of(f, PINDIR_INPUT) {
+                        Some(ip) => graph.ConnectDirect(&pin, &ip, None),
+                        None => Err(E_FAIL.into()),
+                    },
+                    (Some(f), Link::Smart) => match pin_of(f, PINDIR_INPUT) {
+                        Some(ip) => graph.Connect(&pin, &ip),
+                        None => Err(E_FAIL.into()),
+                    },
+                    (None, _) => graph.Render(&pin),
+                };
+                if r.is_ok() {
+                    ok = true;
+                    break 'pins;
+                }
             }
         }
-
-        let mut evr_ctl = None;
-        let mut evr_filter: Option<IBaseFilter> = None;
-        if use_evr {
-            let evr: IBaseFilter = CoCreateInstance(&CLSID_EnhancedVideoRenderer, None, CLSCTX_INPROC_SERVER)?;
-            graph.AddFilter(&evr, w!("EVR"))?;
-            let svc: IMFGetService = evr.cast()?;
-            let ctl: IMFVideoDisplayControl = svc.GetService(&MR_VIDEO_RENDER_SERVICE)?;
-            ctl.SetVideoWindow(hwnd)?;
-            ctl.SetAspectRatioMode(MFVideoARMode_PreservePicture.0 as u32)?;
-            let _ = ctl.SetBorderColor(COLORREF(0));
-            evr_ctl = Some(ctl);
-            evr_filter = Some(evr);
-        }
-
-        // Capture pin first (full frame rate, no Smart Tee), then preview pin;
-        // Interleaved covers DV-style sources.
-        let mut ok = false;
-        'outer: for cat in [&PIN_CATEGORY_CAPTURE, &PIN_CATEGORY_PREVIEW] {
-            for mt in [&MEDIATYPE_Video, &MEDIATYPE_Interleaved] {
-                if cgb
-                    .RenderStream(Some(cat as *const GUID), mt, &src, None::<&IBaseFilter>, evr_filter.as_ref())
-                    .is_ok()
-                {
-                    ok = true;
-                    break 'outer;
+        if !ok && link == Link::Smart {
+            // Odd sources: let the capture graph builder figure it out.
+            'outer: for cat in [&PIN_CATEGORY_CAPTURE, &PIN_CATEGORY_PREVIEW] {
+                for mt in [&MEDIATYPE_Video, &MEDIATYPE_Interleaved] {
+                    if cgb.RenderStream(Some(cat as *const GUID), mt, src, None::<&IBaseFilter>, rfilter.as_ref()).is_ok() {
+                        ok = true;
+                        break 'outer;
+                    }
                 }
             }
         }
         if !ok {
-            return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
+            return Err(BuildError::Failed(E_FAIL.into()));
         }
 
-        let renderer = match evr_ctl {
-            Some(ctl) => Renderer::Evr(ctl),
+        let renderer = match renderer {
+            Some(r) => r,
             None => {
                 let vw: IVideoWindow = graph.cast()?;
                 vw.SetOwner(hwnd.0 as isize)?;
@@ -171,20 +342,66 @@ impl Graph {
             }
         };
 
-        if let Ok(ev) = graph.cast::<IMediaEventEx>() {
-            let _ = ev.SetNotifyWindow(hwnd.0 as isize, notify_msg as i32, 0);
+        log_filters(graph);
+        let control: IMediaControl = graph.cast()?;
+        let g = Graph { control, renderer, graph: graph.clone(), format };
+        g.control.Run()?;
+
+        // Converter chains sometimes connect fine and then stop at once
+        // (e.g. a pixel format nobody can convert). Give them a moment.
+        if link == Link::Smart && g.stopped_within(600) {
+            return Err(BuildError::Failed(E_FAIL.into()));
         }
 
-        let control: IMediaControl = graph.cast()?;
-        let g = Graph { control, renderer, _graph: graph, format };
-        g.control.Run()?;
+        if let Ok(ev) = g.graph.cast::<IMediaEventEx>() {
+            let _ = ev.SetNotifyWindow(hwnd.0 as isize, notify_msg as i32, 0);
+        }
+        debug_log(&format!("playing {}: {kind:?}/{link:?} alt {alt} [{}]", dev.name, g.format));
         Ok(g)
+    }
+
+    /// Waits up to `ms` for an event saying the stream ended or failed.
+    unsafe fn stopped_within(&self, ms: i32) -> bool {
+        let Ok(ev) = self.graph.cast::<IMediaEvent>() else { return false };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as i32;
+            if left <= 0 {
+                return false;
+            }
+            let (mut code, mut p1, mut p2) = (0i32, 0isize, 0isize);
+            if ev.GetEvent(&mut code, &mut p1, &mut p2, left).is_err() {
+                return false; // timeout: still running
+            }
+            let _ = ev.FreeEventParams(code, p1, p2);
+            if is_failure(code as u32) {
+                return true;
+            }
+        }
+    }
+
+    /// Drains graph events; returns true when the device is gone or the stream died.
+    pub fn failed(&self) -> bool {
+        let mut failed = false;
+        unsafe {
+            let Ok(ev) = self.graph.cast::<IMediaEventEx>() else { return false };
+            let (mut code, mut p1, mut p2) = (0i32, 0isize, 0isize);
+            while ev.GetEvent(&mut code, &mut p1, &mut p2, 0).is_ok() {
+                debug_log(&format!("event {code} p1={p1:#x} p2={p2:#x}"));
+                failed |= is_failure(code as u32);
+                let _ = ev.FreeEventParams(code, p1, p2);
+            }
+        }
+        failed
     }
 
     pub fn resize(&self, rc: RECT) {
         unsafe {
             match &self.renderer {
                 Renderer::Evr(ctl) => {
+                    let _ = ctl.SetVideoPosition(std::ptr::null(), &rc);
+                }
+                Renderer::Vmr9(ctl) => {
                     let _ = ctl.SetVideoPosition(std::ptr::null(), &rc);
                 }
                 Renderer::Legacy(vw, bv) => {
@@ -209,35 +426,69 @@ impl Graph {
         }
     }
 
-    /// Needed in WM_PAINT for EVR (windowless) so the last frame is redrawn.
-    pub fn repaint(&self) {
-        if let Renderer::Evr(ctl) = &self.renderer {
+    /// Called from WM_PAINT so the last frame is redrawn.
+    pub fn repaint(&self, hwnd: HWND, hdc: HDC) {
+        unsafe {
+            match &self.renderer {
+                Renderer::Evr(ctl) => {
+                    let _ = ctl.RepaintVideo();
+                }
+                Renderer::Vmr9(ctl) => {
+                    let _ = ctl.RepaintVideo(hwnd, hdc);
+                }
+                Renderer::Legacy(..) => {}
+            }
+        }
+    }
+
+    /// Debug aid: logs size and mean brightness of the frame on screen.
+    pub fn debug_snapshot(&self) {
+        unsafe {
+            let (w, h, mean) = match &self.renderer {
+                Renderer::Evr(ctl) => {
+                    let mut bih = windows::Win32::Graphics::Gdi::BITMAPINFOHEADER {
+                        biSize: size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32,
+                        ..Default::default()
+                    };
+                    let (mut dib, mut cb, mut ts) = (std::ptr::null_mut(), 0u32, 0i64);
+                    if let Err(e) = ctl.GetCurrentImage(&mut bih, &mut dib, &mut cb, &mut ts) {
+                        debug_log(&format!("snapshot failed: {e:?}"));
+                        return;
+                    }
+                    let data = std::slice::from_raw_parts(dib, cb as usize);
+                    let mean = data.iter().map(|&b| b as u64).sum::<u64>() as f64 / cb.max(1) as f64;
+                    CoTaskMemFree(Some(dib as _));
+                    (bih.biWidth, bih.biHeight, mean)
+                }
+                _ => {
+                    debug_log("snapshot: only implemented for EVR");
+                    return;
+                }
+            };
+            debug_log(&format!("snapshot {w}x{h} mean byte value {mean:.1}"));
+        }
+    }
+
+    pub fn display_changed(&self) {
+        if let Renderer::Vmr9(ctl) = &self.renderer {
             unsafe {
-                let _ = ctl.RepaintVideo();
+                let _ = ctl.DisplayModeChanged();
             }
         }
     }
 
-    pub fn is_evr(&self) -> bool {
-        matches!(self.renderer, Renderer::Evr(_))
+    /// True when the renderer paints the whole client area itself (incl. black bars).
+    pub fn paints_window(&self) -> bool {
+        !matches!(self.renderer, Renderer::Legacy(..))
     }
-}
 
-/// Drains graph events; returns true when the device is gone or the stream died.
-pub fn device_failed(graph: &Graph) -> bool {
-    let mut failed = false;
-    unsafe {
-        let Ok(ev) = graph._graph.cast::<IMediaEventEx>() else { return false };
-        let (mut code, mut p1, mut p2) = (0i32, 0isize, 0isize);
-        while ev.GetEvent(&mut code, &mut p1, &mut p2, 0).is_ok() {
-            let c = code as u32;
-            if c == EC_DEVICE_LOST || c == EC_ERRORABORT || c == EC_USERABORT || c == EC_COMPLETE {
-                failed = true;
-            }
-            let _ = ev.FreeEventParams(code, p1, p2);
+    pub fn renderer_name(&self) -> &'static str {
+        match self.renderer {
+            Renderer::Evr(_) => "EVR",
+            Renderer::Vmr9(_) => "VMR-9",
+            Renderer::Legacy(..) => "legacy renderer",
         }
     }
-    failed
 }
 
 impl Drop for Graph {
@@ -248,8 +499,49 @@ impl Drop for Graph {
                 let _ = vw.SetVisible(0);
                 let _ = vw.SetOwner(0);
             }
-            if let Ok(ev) = self._graph.cast::<IMediaEventEx>() {
+            if let Ok(ev) = self.graph.cast::<IMediaEventEx>() {
                 let _ = ev.SetNotifyWindow(0, 0, 0);
+            }
+        }
+    }
+}
+
+fn is_failure(code: u32) -> bool {
+    code == EC_DEVICE_LOST || code == EC_ERRORABORT || code == EC_USERABORT || code == EC_COMPLETE
+}
+
+unsafe fn pin_of(f: &IBaseFilter, dir: PIN_DIRECTION) -> Option<IPin> {
+    let pins = f.EnumPins().ok()?;
+    loop {
+        let mut p = [None];
+        let mut n = 0u32;
+        if pins.Next(&mut p, Some(&mut n)).is_err() || n == 0 {
+            return None;
+        }
+        let pin = p[0].take()?;
+        if pin.QueryDirection().ok() == Some(dir) {
+            return Some(pin);
+        }
+    }
+}
+
+unsafe fn log_filters(graph: &IGraphBuilder) {
+    if std::env::var_os("MAGICCAM_DEBUG").is_none() {
+        return;
+    }
+    let Ok(ef) = graph.EnumFilters() else { return };
+    loop {
+        let mut f = [None];
+        let mut n = 0u32;
+        if ef.Next(&mut f, Some(&mut n)).is_err() || n == 0 {
+            break;
+        }
+        if let Some(f) = &f[0] {
+            let mut info = FILTER_INFO::default();
+            if f.QueryFilterInfo(&mut info).is_ok() {
+                ManuallyDrop::drop(&mut info.pGraph);
+                let end = info.achName.iter().position(|&c| c == 0).unwrap_or(128);
+                debug_log(&format!("  filter: {}", String::from_utf16_lossy(&info.achName[..end])));
             }
         }
     }
@@ -261,12 +553,35 @@ impl Drop for Graph {
 const MJPG: GUID = GUID::from_u128(0x47504A4D_0000_0010_8000_00AA00389B71);
 const H264: GUID = GUID::from_u128(0x34363248_0000_0010_8000_00AA00389B71);
 const HEVC: GUID = GUID::from_u128(0x43564548_0000_0010_8000_00AA00389B71);
+const NV12: GUID = GUID::from_u128(0x3231564E_0000_0010_8000_00AA00389B71);
+const YUY2: GUID = GUID::from_u128(0x32595559_0000_0010_8000_00AA00389B71);
+const I420: GUID = GUID::from_u128(0x30323449_0000_0010_8000_00AA00389B71);
 
 struct Caps {
     w: i32,
     h: i32,
     fps: f64,
     sub: GUID,
+}
+
+fn subtype_name(g: &GUID) -> String {
+    match *g {
+        MJPG => "MJPEG".into(),
+        H264 => "H.264".into(),
+        HEVC => "HEVC".into(),
+        NV12 => "NV12".into(),
+        YUY2 => "YUY2".into(),
+        I420 => "I420".into(),
+        _ => {
+            // FOURCC-style subtypes: print the four characters
+            let b = g.data1.to_le_bytes();
+            if g.data2 == 0 && b.iter().all(|c| c.is_ascii_alphanumeric()) {
+                String::from_utf8_lossy(&b).into_owned()
+            } else {
+                "RGB".into()
+            }
+        }
+    }
 }
 
 unsafe fn parse(mt: &AM_MEDIA_TYPE) -> Option<Caps> {
@@ -298,10 +613,12 @@ unsafe fn free_mt(pmt: *mut AM_MEDIA_TYPE) {
     CoTaskMemFree(Some(pmt as _));
 }
 
-/// Picks the "best live" format: smooth (>=24 fps) first, then the largest
-/// resolution not above `max_height`, then the highest fps, then the cheapest
-/// to decode (raw > MJPEG > H.264/HEVC, which may need a missing decoder).
-unsafe fn choose_format(cgb: &ICaptureGraphBuilder2, src: &IBaseFilter, max_height: i32) -> Option<String> {
+/// Ranks the device's formats and applies alternative number `alt`.
+///
+/// Best mode: smooth (>=24 fps) first, then the largest resolution not above
+/// `max_height`, then the highest fps. Alternatives are the other pixel formats
+/// of that same mode, cheapest to display first (raw > MJPEG > H.264/HEVC).
+unsafe fn set_format(cgb: &ICaptureGraphBuilder2, src: &IBaseFilter, max_height: i32, alt: usize) -> Option<String> {
     let mut cfg: Option<IAMStreamConfig> = None;
     for cat in [&PIN_CATEGORY_CAPTURE, &PIN_CATEGORY_PREVIEW] {
         let mut p = std::ptr::null_mut();
@@ -320,35 +637,32 @@ unsafe fn choose_format(cgb: &ICaptureGraphBuilder2, src: &IBaseFilter, max_heig
     let mut buf = vec![0u8; size.max(256) as usize];
     let max_h = if max_height > 0 { max_height } else { i32::MAX };
 
-    let mut best: Option<(i32, (bool, bool, i64, i64, u8))> = None;
+    // (index, mode score, pixel-format cost)
+    let mut all: Vec<(i32, (bool, bool, i64, i64), u8)> = Vec::new();
     for i in 0..count {
         let mut pmt = std::ptr::null_mut();
         if cfg.GetStreamCaps(i, &mut pmt, buf.as_mut_ptr()).is_err() || pmt.is_null() {
             continue;
         }
         if let Some(c) = parse(&*pmt) {
-            let cost = if c.sub == H264 || c.sub == HEVC { 0 } else if c.sub == MJPG { 1 } else { 2 };
-            let score = (
-                c.fps >= 23.5,
-                c.h <= max_h,
-                c.w as i64 * c.h as i64,
-                (c.fps * 100.0) as i64,
-                cost,
-            );
-            if best.as_ref().map_or(true, |(_, s)| score > *s) {
-                best = Some((i, score));
-            }
+            let cost = match c.sub {
+                H264 | HEVC => 0,
+                MJPG => 1,
+                _ => 2,
+            };
+            let mode = (c.fps >= 23.5, c.h <= max_h, c.w as i64 * c.h as i64, (c.fps * 100.0).round() as i64);
+            all.push((i, mode, cost));
         }
         free_mt(pmt);
     }
+    let best_mode = all.iter().map(|a| a.1).max()?;
+    let mut alts: Vec<_> = all.into_iter().filter(|a| a.1 == best_mode).collect();
+    alts.sort_by_key(|a| std::cmp::Reverse(a.2)); // stable: keeps the device's own order otherwise
+    let idx = alts.get(alt)?.0;
 
-    let (idx, _) = best?;
     let mut pmt = std::ptr::null_mut();
     cfg.GetStreamCaps(idx, &mut pmt, buf.as_mut_ptr()).ok()?;
-    let desc = parse(&*pmt).map(|c| {
-        let kind = if c.sub == MJPG { "MJPEG" } else if c.sub == H264 { "H.264" } else if c.sub == HEVC { "HEVC" } else { "raw" };
-        format!("{}x{} @ {:.2} fps {}", c.w, c.h, c.fps, kind)
-    });
+    let desc = parse(&*pmt).map(|c| format!("{}x{} @ {:.2} fps {}", c.w, c.h, c.fps, subtype_name(&c.sub)));
     let ok = cfg.SetFormat(pmt).is_ok();
     free_mt(pmt);
     if ok { desc } else { None }
