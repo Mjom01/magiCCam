@@ -1,6 +1,6 @@
 [package]
 name = "magiccam"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Lightweight fullscreen live viewer for any Windows camera / capture device"
 license = "MIT"

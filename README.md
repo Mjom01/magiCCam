@@ -69,4 +69,4 @@ $env:MAGICCAM_DEBUG=1; .\magiccam.exe -w
 ```
 cargo build --release
 ```
-Kimenet: `target/release/magiccam.exe` (Windows 7+, x64).
+Kimenet: `target/release/magiccam.exe` (Windows 10/11, x64). A C runtime statikusan van belefordítva, így nem kell hozzá VC++ Redistributable.
