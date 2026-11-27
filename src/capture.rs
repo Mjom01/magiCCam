@@ -343,6 +343,12 @@ impl Graph {
         };
 
         log_filters(graph);
+        // Live view: no reference clock, so every frame is shown the moment it
+        // arrives. Lowest latency, and immune to sources with odd timestamps
+        // (OBS Virtual Camera frames were otherwise held back forever = black).
+        if let Ok(mf) = graph.cast::<IMediaFilter>() {
+            let _ = mf.SetSyncSource(None::<&windows::Win32::Media::IReferenceClock>);
+        }
         let control: IMediaControl = graph.cast()?;
         let g = Graph { control, renderer, graph: graph.clone(), format };
         g.control.Run()?;
