@@ -43,7 +43,14 @@ magiccam -d 2 -m 2           # 2. eszköz a 2. monitoron
 magiccam -w                  # ablakban indul
 magiccam --max-height 720    # max. 720p automatikus választásnál (0 = nincs limit)
 magiccam -k                  # ne állítson formátumot
+magiccam --clock on          # késő képkockák eldobása (legkisebb késleltetés)
+magiccam --clock off         # minden képkocka kirajzolása (OBS-hez kell)
 ```
+
+**Késleltetés:** a hardveres forrásoknál (USB-kamera, ATEM, capture kártya, DeckLink) a
+renderer referenciaórával fut, így a késve érkező képkockákat eldobja, és mindig a legfrissebbet
+mutatja. A szoftveres virtuális kameráknál (OBS, NVIDIA Broadcast) óra nélkül fut, mert azok
+időbélyegeihez egyik óra sem illeszkedik. Ezt az app magától eldönti (`--clock auto`), de felülírható.
 
 | Billentyű | Funkció |
 |---|---|

@@ -105,8 +105,18 @@ unsafe fn read_prop(bag: &IPropertyBag, name: PCWSTR) -> Option<String> {
     s.filter(|s| !s.is_empty())
 }
 
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum ClockMode {
+    /// Clock for hardware sources, none for software virtual cameras.
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct Options {
+    pub clock: ClockMode,
     /// Never touch the device's output format (always true for DeckLink-style cards).
     pub keep_format: bool,
     /// Upper bound for the auto-selected resolution (keeps MJPEG decode cheap on weak CPUs).
@@ -343,11 +353,21 @@ impl Graph {
         };
 
         log_filters(graph);
-        // Live view: no reference clock, so every frame is shown the moment it
-        // arrives. Lowest latency, and immune to sources with odd timestamps
-        // (OBS Virtual Camera frames were otherwise held back forever = black).
-        if let Ok(mf) = graph.cast::<IMediaFilter>() {
-            let _ = mf.SetSyncSource(None::<&windows::Win32::Media::IReferenceClock>);
+        // Clock: hardware sources (UVC/KS devices such as webcams, ATEM, capture
+        // cards, DeckLink) timestamp frames against the graph clock, so with a
+        // clock the renderer drops late frames and latency stays minimal — without
+        // one, any startup backlog would become permanent delay. Software
+        // DirectShow sources (OBS Virtual Camera, NVIDIA Broadcast) use timestamps
+        // no graph clock matches, so their frames are only shown without a clock.
+        let use_clock = match opts.clock {
+            ClockMode::On => true,
+            ClockMode::Off => false,
+            ClockMode::Auto => dev.path.is_some() || pro_card,
+        };
+        if !use_clock {
+            if let Ok(mf) = graph.cast::<IMediaFilter>() {
+                let _ = mf.SetSyncSource(None::<&windows::Win32::Media::IReferenceClock>);
+            }
         }
         let control: IMediaControl = graph.cast()?;
         let g = Graph { control, renderer, graph: graph.clone(), format };
@@ -362,7 +382,7 @@ impl Graph {
         if let Ok(ev) = g.graph.cast::<IMediaEventEx>() {
             let _ = ev.SetNotifyWindow(hwnd.0 as isize, notify_msg as i32, 0);
         }
-        debug_log(&format!("playing {}: {kind:?}/{link:?} alt {alt} [{}]", dev.name, g.format));
+        debug_log(&format!("playing {}: {kind:?}/{link:?} alt {alt} clock={use_clock} [{}]", dev.name, g.format));
         Ok(g)
     }
 

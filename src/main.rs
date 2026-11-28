@@ -6,7 +6,7 @@ mod capture;
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
-use capture::{Device, Graph, Options};
+use capture::{ClockMode, Device, Graph, Options};
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -71,6 +71,8 @@ USAGE: magiccam [options]
   -w, --windowed        start in a window instead of fullscreen
   -k, --keep-format     do not change the device's output format
       --max-height <n>  highest auto-selected resolution (default 1080, 0 = no limit)
+      --clock <mode>    auto (default) | on = drop late frames, lowest latency |
+                        off = show every frame (needed by OBS Virtual Camera)
 
 KEYS: Esc/Q quit | F/F11/Enter/double-click fullscreen | Tab/arrows/1-9 switch camera
       M next monitor | R rescan devices | right-click menu";
@@ -81,7 +83,7 @@ fn parse_args() -> Result<Args, String> {
         device: None,
         monitor: None,
         windowed: false,
-        opts: Options { keep_format: false, max_height: 1080 },
+        opts: Options { keep_format: false, max_height: 1080, clock: ClockMode::Auto },
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -93,6 +95,14 @@ fn parse_args() -> Result<Args, String> {
             "-m" | "--monitor" => {
                 let n: usize = it.next().and_then(|v| v.parse().ok()).ok_or("--monitor needs a number")?;
                 a.monitor = Some(n.saturating_sub(1));
+            }
+            "--clock" => {
+                a.opts.clock = match it.next().as_deref() {
+                    Some("auto") => ClockMode::Auto,
+                    Some("on") => ClockMode::On,
+                    Some("off") => ClockMode::Off,
+                    _ => return Err("--clock needs auto, on or off".into()),
+                }
             }
             "--max-height" => {
                 a.opts.max_height = it.next().and_then(|v| v.parse().ok()).ok_or("--max-height needs a number")?
@@ -143,8 +153,12 @@ fn main() {
         }
         for (i, d) in devices.iter().enumerate() {
             s.push_str(&format!("{:>2}: {}\n", i + 1, d.name));
+            if std::env::var_os("MAGICCAM_DEBUG").is_some() {
+                s.push_str(&format!("      path: {:?}\n", d.path));
+            }
         }
         console_print(s.trim_end());
+        drop(devices); // release COM objects before COM shuts down
         unsafe { CoUninitialize() };
         return;
     }
