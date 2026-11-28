@@ -2,11 +2,12 @@
 //! magiCCam — show any Windows video source fullscreen, as a live feed.
 
 mod capture;
+mod mf;
 
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
-use capture::{ClockMode, Device, Graph, Options};
+use capture::{ClockMode, Device, Engine, Options, Viewer};
 use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -34,7 +35,7 @@ struct App {
     current: Option<usize>,
     /// Key of the device we want to show (survives unplug / re-enumeration).
     wanted: Option<String>,
-    graph: Option<Graph>,
+    graph: Option<Box<dyn Viewer>>,
     opts: Options,
     fullscreen: bool,
     windowed_rect: RECT,
@@ -71,6 +72,8 @@ USAGE: magiccam [options]
   -w, --windowed        start in a window instead of fullscreen
   -k, --keep-format     do not change the device's output format
       --max-height <n>  highest auto-selected resolution (default 1080, 0 = no limit)
+      --engine <e>      auto (default: Media Foundation + GPU decode for hardware
+                        devices, DirectShow for the rest) | mf | dshow
       --clock <mode>    auto (default) | on = drop late frames, lowest latency |
                         off = show every frame (needed by OBS Virtual Camera)
 
@@ -83,7 +86,7 @@ fn parse_args() -> Result<Args, String> {
         device: None,
         monitor: None,
         windowed: false,
-        opts: Options { keep_format: false, max_height: 1080, clock: ClockMode::Auto },
+        opts: Options { keep_format: false, max_height: 1080, clock: ClockMode::Auto, engine: Engine::Auto },
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -95,6 +98,14 @@ fn parse_args() -> Result<Args, String> {
             "-m" | "--monitor" => {
                 let n: usize = it.next().and_then(|v| v.parse().ok()).ok_or("--monitor needs a number")?;
                 a.monitor = Some(n.saturating_sub(1));
+            }
+            "--engine" => {
+                a.opts.engine = match it.next().as_deref() {
+                    Some("auto") => Engine::Auto,
+                    Some("mf") => Engine::Mf,
+                    Some("dshow") => Engine::DirectShow,
+                    _ => return Err("--engine needs auto, mf or dshow".into()),
+                }
             }
             "--clock" => {
                 a.opts.clock = match it.next().as_deref() {
@@ -312,7 +323,7 @@ impl App {
 
     fn update_title(&self) {
         let title = match (self.current, &self.graph) {
-            (Some(i), Some(g)) => format!("magiCCam - {} [{}]", self.devices[i].name, g.format),
+            (Some(i), Some(g)) => format!("magiCCam - {} [{}]", self.devices[i].name, g.format()),
             _ => format!("magiCCam - {}", self.status),
         };
         unsafe {
@@ -347,7 +358,7 @@ impl App {
         unsafe {
             let _ = UpdateWindow(self.hwnd);
         }
-        match Graph::open(&self.devices[idx], self.hwnd, WM_GRAPH, self.opts) {
+        match capture::open_viewer(&self.devices[idx], self.hwnd, WM_GRAPH, self.opts) {
             Ok(g) => {
                 g.resize(self.client_rect());
                 self.graph = Some(g);
@@ -498,7 +509,7 @@ impl App {
             let _ = AppendMenuW(menu, MF_STRING, ID_MONITOR, w!("Next &monitor\tM"));
             let _ = AppendMenuW(menu, MF_STRING, ID_REFRESH, w!("&Rescan devices\tR"));
             if let Some(g) = &self.graph {
-                let info = format!("{} / {}", g.format, g.renderer_name());
+                let info = format!("{} / {}", g.format(), g.renderer_name());
                 let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(wide(&info).as_ptr()));
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);

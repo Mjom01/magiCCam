@@ -1,6 +1,6 @@
 [package]
 name = "magiccam"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "Lightweight fullscreen live viewer for any Windows camera / capture device"
 license = "MIT"
@@ -10,6 +10,10 @@ version = "0.62"
 features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Media_DirectShow",
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",

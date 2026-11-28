@@ -1,6 +1,6 @@
 # magiCCam
 
-Pehelysúlyú (≈220 KB, nulla függőség a Windows API-n kívül) Rust app, ami **bármilyen Windowsos videóforrást** teljes képernyőn, élő feedként mutat:
+Pehelysúlyú (≈400 KB, telepítés és függőségek nélkül) Rust app, ami **bármilyen Windowsos videóforrást** teljes képernyőn, élő feedként mutat:
 
 - USB / UVC webkamerák
 - **OBS Virtual Camera**, NDI Webcam, NVIDIA Broadcast és más virtuális kamerák
@@ -9,26 +9,24 @@ Pehelysúlyú (≈220 KB, nulla függőség a Windows API-n kívül) Rust app, a
 
 ## Hogyan működik
 
-DirectShow-t használ, mert ez az egyetlen Windows API, ami *minden* fenti forrást lát
-(az OBS virtuális kamera és a DeckLink is csak itt jelenik meg). A kép GPU-s rendererbe
-(EVR, ill. VMR-9) megy, ami skáláz és letterboxol — gyenge gépen is alig terhel.
+Két motorral dolgozik, eszközönként automatikusan választva:
 
-Megnyitáskor egy rövid tervet jár végig, és az első működő kombinációt használja:
+**Hardveres eszközök** (USB/UVC kamerák, ATEM Mini, capture kártyák, NDI Webcam) →
+**Media Foundation + Direct3D 11**, ugyanúgy, ahogy a Windows Kamera app:
+- alacsony késleltetésű olvasás (`MF_LOW_LATENCY`), a tömörített képet (MJPEG/H.264) a
+  videokártya dekódolja, ha a driver tud ilyet;
+- a D3D11 videoprocesszor GPU-n konvertál, skáláz és letterboxol, egy flip-model swapchainre;
+- sosem vár a vsync-re: ha a forrás gyorsabb a kijelzőnél, a régi képkocka kiesik, így késés
+  nem tud felgyűlni. Mindig a legfrissebb kép látszik.
 
-1. forrás → GPU renderer **közvetlenül** (nulla konverzió — a hardveres kamerák/kártyák így mennek)
-2. ugyanez VMR-9-cel (régebbi gépek)
-3. DirectShow által beszúrt dekóderrel/konverterrel (MJPEG kamerák, illetve a virtuális kamerák,
-   pl. OBS, NVIDIA Broadcast, amik nem hajlandók közvetlenül GPU-pufferbe írni)
-4. bármilyen renderer (végső tartalék)
-
-Minden lépésnél kipróbálja ugyanannak a módnak (felbontás + fps) a többi pixelformátumát is
-(NV12 / I420 / YUY2 / MJPEG...), és ellenőrzi, hogy a stream tényleg fut-e (pl. az OBS NV12-je
-csatlakozik, de azonnal leáll — ilyenkor továbblép). A működő kombinációt eszközönként megjegyzi,
-így az újracsatlakozás azonnali.
+**Szoftveres források** (OBS Virtual Camera, NVIDIA Broadcast), **DeckLink**-szerű kártyák, és
+minden, amit az MF nem tud megnyitni → **DirectShow**, mert csak az látja ezeket. Egy rövid tervet
+jár végig (közvetlen GPU renderer → beszúrt dekóder/konverter → bármilyen renderer, minden
+pixelformátummal), ellenőrzi, hogy a stream tényleg fut-e, és eszközönként megjegyzi, mi működött.
 
 Formátumválasztás: folyamatos (≥24 fps) mód előnyben, max. 1080p (állítható), a nyers
-formátum előnyben az MJPEG/H.264-gyel szemben (kevesebb CPU). DeckLink-szerű kártyáknál
-a kártya beállított formátumához nem nyúl.
+formátum előnyben az MJPEG/H.264-gyel szemben. DeckLink-szerű kártyáknál a kártya beállított
+formátumához nem nyúl.
 
 Ha a forrás leesik (kihúzzák, OBS leáll), 2 másodpercenként újrapróbálja és magától visszajön.
 Futás közben nem engedi elaludni a kijelzőt.
@@ -43,11 +41,12 @@ magiccam -d 2 -m 2           # 2. eszköz a 2. monitoron
 magiccam -w                  # ablakban indul
 magiccam --max-height 720    # max. 720p automatikus választásnál (0 = nincs limit)
 magiccam -k                  # ne állítson formátumot
-magiccam --clock on          # késő képkockák eldobása (legkisebb késleltetés)
-magiccam --clock off         # minden képkocka kirajzolása (OBS-hez kell)
+magiccam --engine dshow      # mindig DirectShow (mf = mindig Media Foundation)
+magiccam --clock on          # DirectShow: késő képkockák eldobása (legkisebb késleltetés)
+magiccam --clock off         # DirectShow: minden képkocka kirajzolása (OBS-hez kell)
 ```
 
-**Késleltetés:** a hardveres forrásoknál (USB-kamera, ATEM, capture kártya, DeckLink) a
+**Késleltetés a DirectShow-motorban:** a hardveres forrásoknál (USB-kamera, ATEM, capture kártya, DeckLink) a
 renderer referenciaórával fut, így a késve érkező képkockákat eldobja, és mindig a legfrissebbet
 mutatja. A szoftveres virtuális kameráknál (OBS, NVIDIA Broadcast) óra nélkül fut, mert azok
 időbélyegeihez egyik óra sem illeszkedik. Ezt az app magától eldönti (`--clock auto`), de felülírható.

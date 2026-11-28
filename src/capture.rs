@@ -114,13 +114,106 @@ pub enum ClockMode {
     Off,
 }
 
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum Engine {
+    /// Media Foundation (GPU decode) for hardware devices, DirectShow otherwise.
+    #[default]
+    Auto,
+    Mf,
+    DirectShow,
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct Options {
+    pub engine: Engine,
     pub clock: ClockMode,
     /// Never touch the device's output format (always true for DeckLink-style cards).
     pub keep_format: bool,
     /// Upper bound for the auto-selected resolution (keeps MJPEG decode cheap on weak CPUs).
     pub max_height: i32,
+}
+
+// ---------------------------------------------------------------------------
+// Viewer: whatever is showing the live picture
+
+pub trait Viewer {
+    fn format(&self) -> &str;
+    fn renderer_name(&self) -> &'static str;
+    fn resize(&self, rc: RECT);
+    fn repaint(&self, hwnd: HWND, hdc: HDC);
+    /// Drains notifications; true when the source is gone or the stream died.
+    fn failed(&self) -> bool;
+    fn display_changed(&self);
+    /// True when the viewer paints the whole client area itself (incl. black bars).
+    fn paints_window(&self) -> bool;
+    fn debug_snapshot(&self);
+}
+
+/// Hardware devices (they have a device path) go through Media Foundation with
+/// GPU decoding — lowest latency, like the Windows Camera app. Software sources
+/// (OBS Virtual Camera...), DeckLink-style cards, and anything MF cannot open
+/// use the DirectShow graph.
+pub fn open_viewer(dev: &Device, hwnd: HWND, notify_msg: u32, opts: Options) -> windows::core::Result<Box<dyn Viewer>> {
+    if opts.engine != Engine::DirectShow {
+        if let Some(path) = &dev.path {
+            match crate::mf::MfViewer::open(path, hwnd, notify_msg, opts) {
+                Ok(v) => {
+                    debug_log(&format!("playing {} via Media Foundation [{}]", dev.name, v.format));
+                    return Ok(Box::new(v));
+                }
+                Err(e) => debug_log(&format!("Media Foundation failed for {}: {e} - using DirectShow", dev.name)),
+            }
+        }
+    }
+    Ok(Box::new(Graph::open(dev, hwnd, notify_msg, opts)?))
+}
+
+impl Viewer for crate::mf::MfViewer {
+    fn format(&self) -> &str {
+        &self.format
+    }
+    fn renderer_name(&self) -> &'static str {
+        "Media Foundation + D3D11"
+    }
+    fn resize(&self, _rc: RECT) {} // the render thread follows the window size
+    fn repaint(&self, _hwnd: HWND, _hdc: HDC) {} // continuously presented
+    fn failed(&self) -> bool {
+        crate::mf::MfViewer::failed(self)
+    }
+    fn display_changed(&self) {}
+    fn paints_window(&self) -> bool {
+        true
+    }
+    fn debug_snapshot(&self) {
+        crate::mf::MfViewer::debug_snapshot(self)
+    }
+}
+
+impl Viewer for Graph {
+    fn format(&self) -> &str {
+        &self.format
+    }
+    fn renderer_name(&self) -> &'static str {
+        Graph::renderer_name(self)
+    }
+    fn resize(&self, rc: RECT) {
+        Graph::resize(self, rc)
+    }
+    fn repaint(&self, hwnd: HWND, hdc: HDC) {
+        Graph::repaint(self, hwnd, hdc)
+    }
+    fn failed(&self) -> bool {
+        Graph::failed(self)
+    }
+    fn display_changed(&self) {
+        Graph::display_changed(self)
+    }
+    fn paints_window(&self) -> bool {
+        Graph::paints_window(self)
+    }
+    fn debug_snapshot(&self) {
+        Graph::debug_snapshot(self)
+    }
 }
 
 // ---------------------------------------------------------------------------
